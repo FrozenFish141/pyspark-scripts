@@ -147,10 +147,64 @@ def generate_price(date):
     
     df_grouped_joined_prices_processed.repartition(1).write.mode('append').partitionBy('data_creation_date').parquet('s3://parquet-intermediate/prices/usd/')
 
+def generate_price_single_source(date, source='cryptocurrency_price_in_usd_coincap'):
+    query_joined_token = """select a.name,a.symbol from (select * from prices.crypto_metadata where source='coincap') a join
+        (select * from prices.crypto_metadata where source='coinmarketcap') b on a.name=b.name and a.symbol=b.symbol
+        group by 1,2"""
+    df_joined_token = spark.sql(query_joined_token)
+    print(df_joined_token.count())
+    df_joined_token.printSchema()
+
+    df_joined_prices = get_filled_price(source, date, df_joined_token)
+    print(df_joined_prices.count())
+
+    df_grouped_joined_prices = df_joined_prices.groupBy(['name','symbol'])\
+        .agg(collect_list(struct(['price','minute'])).alias('price_info'))
+    df_grouped_joined_prices.printSchema()
+    
+    def transform(sqlrow):
+        row = sqlrow.asDict()
+        price_info = row['price_info']  
+        price_info.sort(key=lambda t: t['minute'])
+        first_not_null_price_index = -1
+        last_price = None
+        for i in range(len(price_info)):
+            price_row = price_info[i].asDict()
+            if price_row['price']:
+                last_price = price_row['price']
+                if first_not_null_price_index < 0:
+                    first_not_null_price_index = i
+            else:
+                price_row['price'] = last_price
+            price_info[i] = price_row
+        if first_not_null_price_index >= 0:
+            first_price = price_info[first_not_null_price_index]['price']
+            for i in range(first_not_null_price_index):
+                price_info[i]['price'] = first_price
+        new_rows = []
+        for price_row in price_info:
+            new_row = {
+                'name': row['name'],
+                'symbol': row['symbol'],
+                'price': price_row['price'],
+                'minute': price_row['minute'],
+                'data_creation_date': date
+            }
+            new_rows.append(Row(**new_row))
+        return new_rows
+
+    rdd_grouped_joined_prices_processed = df_grouped_joined_prices.rdd.flatMap(transform)
+    df_grouped_joined_prices_processed = rdd_grouped_joined_prices_processed.toDF()
+    df_grouped_joined_prices_processed.printSchema()
+    print(df_grouped_joined_prices_processed.count())
+    
+    df_grouped_joined_prices_processed.repartition(1).write.mode('append').partitionBy('data_creation_date').parquet('s3://parquet-intermediate/prices/usd/')
+
 def argument_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('date', metavar='date', type=str,
                         help='date to check')
+    parser.add_argument('-s', '--single', action='store_true', help='use single source')
     args = parser.parse_args()
     return args
 
@@ -163,4 +217,7 @@ if __name__ == "__main__":
     spark = ignite()
     sqlContext = SQLContext(sc)
 
-    generate_price(date)
+    if args.single:
+        generate_price_single_source(date)
+    else:
+        generate_price(date)
